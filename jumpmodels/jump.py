@@ -354,6 +354,9 @@ class JumpModel(BaseClusteringAlgo):
     jump_penalty : float, default=0.
         Penalty term (`lambda`) applied to state transitions in both discrete and continuous models.
 
+    distribution : str, default="Gaussian"
+        The distribution assumed for the HMM. Options are "Gaussian" and "Poisson".
+
     cont : bool, default=False
         If `True`, the continuous jump model is used. Otherwise, the discrete model is applied.
 
@@ -403,6 +406,7 @@ class JumpModel(BaseClusteringAlgo):
     def __init__(self,
                  n_components: int = 2, 
                  jump_penalty: float = 0., 
+                 distribution: str = "Gaussian",
                  cont: bool = False, 
                  grid_size: float = 0.05, 
                  mode_loss: bool = True, 
@@ -498,6 +502,9 @@ class JumpModel(BaseClusteringAlgo):
 
         sort_by : ["cumret", "vol", "freq", "ret"], optional (default="cumret")
             Criterion for sorting the states.
+
+        distribution : str, optional (default="Gaussian")
+            The assumed distribution for the HMM ("Gaussian" or "Poisson").
         """
         # valid feat weights
         valid_feat_weights(feat_weights)
@@ -524,7 +531,7 @@ class JumpModel(BaseClusteringAlgo):
             # initialize the labels and value in the previous iteration.
             labels_pre, val_pre = None, np.inf
             # do one E step
-            proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs)
+            proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs, distribution=self.distribution)
             num_iter = 0
             # iterate between M and E steps
             while (num_iter < max_iter and (not is_same_clustering(labels_, labels_pre)) and val_pre - val_ > tol):
@@ -532,9 +539,9 @@ class JumpModel(BaseClusteringAlgo):
                 num_iter += 1
                 labels_pre, val_pre = labels_, val_
                 # M step: update centers
-                centers_ = weighted_mean_cluster(X_arr, proba_) 
+                centers_ = weighted_mean_cluster(X_arr, proba_)
                 # E step
-                proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs)
+                proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs, distribution=self.distribution)
             if verbose: print(f"{n_init_}-th init. val: {val_}")
             # compare with previous initializations
             if (not is_same_clustering(best_res['labels_'], labels_)) and val_ < best_val:
@@ -561,21 +568,11 @@ class JumpModel(BaseClusteringAlgo):
     # reviewed
     def predict_proba_online(self, X: DF_ARR_TYPE) -> DF_ARR_TYPE:
         """
-        Predict the probability of each state in an online fashion, where the prediction 
-        for the i-th row is based only on data prior to that row.
-
-        Parameters
-        ----------
-        X : DataFrame or ndarray
-            The input data matrix.
-
-        Returns
-        -------
-        DataFrame or ndarray
-            The predicted probabilities for each state.
+        Predict the probability of each state in an online fashion.
+        Uses the distribution specified in the class constructor.
         """
         X_arr = self.check_X_predict_func(X)
-        value_mx = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, return_value_mx=True)
+        value_mx = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, return_value_mx=True, distribution=self.distribution)
         labels_ = value_mx.argmin(axis=1)
         proba_ = raise_JM_labels_to_proba(labels_, self.n_components, self.prob_vecs)
         return raise_JM_proba_to_df(proba_, X)
@@ -590,6 +587,9 @@ class JumpModel(BaseClusteringAlgo):
         ----------
         X : DataFrame or ndarray
             The input data matrix.
+
+        distribution : str, optional (default="Gaussian")
+            The assumed distribution for the HMM ("Gaussian" or "Poisson").
 
         Returns
         -------
@@ -611,13 +611,16 @@ class JumpModel(BaseClusteringAlgo):
         use_viterbi : bool, optional (default=True)
             Whether to use the Viterbi solver.
 
+        distribution : str, optional (default="Gaussian")
+            The assumed distribution for the HMM ("Gaussian" or "Poisson").
+
         Returns
         -------
         DataFrame or ndarray
             The predicted probabilities for each state.
         """
         X_arr = self.check_X_predict_func(X)
-        proba_, _, _ = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs)
+        proba_, _, _ = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, distribution=self.distribution)
         return raise_JM_proba_to_df(proba_, X)
 
     # reviewed
@@ -632,6 +635,9 @@ class JumpModel(BaseClusteringAlgo):
 
         use_viterbi : bool, optional (default=True)
             Whether to use the Viterbi solver.
+
+        distribution : str, optional (default="Gaussian")
+            The assumed distribution for the HMM ("Gaussian" or "Poisson").
 
         Returns
         -------
