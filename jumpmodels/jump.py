@@ -163,7 +163,8 @@ def do_E_step(X: np.ndarray,
               centers_: np.ndarray, 
               penalty_mx: np.ndarray, 
               prob_vecs: Optional[np.ndarray] = None, 
-              return_value_mx: bool = False) -> Union[tuple[np.ndarray, np.ndarray, float], np.ndarray]:
+              return_value_mx: bool = False,
+              distribution: str = "Gaussian") -> Union[tuple[np.ndarray, np.ndarray, float], np.ndarray]:
     """
     Perform a single E-step: compute the loss matrix and calling the solver.
 
@@ -188,6 +189,9 @@ def do_E_step(X: np.ndarray,
     return_value_mx : bool, optional (default=False)
         If `True`, return the value matrix from the DP algorithm, which can be used for online inference.
 
+    distribution : str, optional (default="Gaussian")
+        Other possibility: "Poisson". The assumed distribution of the HMM.
+
     Returns
     -------
     tuple[np.ndarray, np.ndarray, float] or np.ndarray
@@ -203,8 +207,22 @@ def do_E_step(X: np.ndarray,
     """
     n_c = len(centers_)     # (n_c, n_f)
     # compute loss matrix
-    loss_mx = .5 * cdist(X, centers_, "sqeuclidean")    # (n_s, n_c)
-                                                        # contain `nan` if `centers_` contains `nan`.
+    if distribution == "Poisson":
+        # Poisson negative log-likelihood loss
+        if np.any(centers_ <= 0):
+            # Using warnings is good practice as it informs without crashing
+            import warnings
+            warnings.warn("Poisson centers (lambda) contain non-positive values. Clamping to a small number.")
+            centers_ = np.maximum(centers_, 1e-10) # A slightly cleaner way to clamp
+
+        # Broadcast X and centers_ to (n_s, n_c, n_f)
+        loss_mx = centers_[np.newaxis, :, :] - X[:, np.newaxis, :] * np.log(centers_[np.newaxis, :, :])
+        loss_mx = np.sum(loss_mx, axis=2)  # shape (n_s, n_c)
+    elif distribution == "Gaussian":
+        loss_mx = .5 * cdist(X, centers_, "sqeuclidean")    # (n_s, n_c)
+        # contain `nan` if `centers_` contains `nan`.
+    else:
+        raise NotImplementedError("Only 'Gaussian' and 'Poisson' distributions are supported.")
     if prob_vecs is not None:    # cont model, (N, n_c)
         # replace the nan in loss_mx by a very large floating number
         loss_mx = np.nan_to_num(loss_mx, nan=LARGE_FLOAT, posinf=LARGE_FLOAT, neginf=LARGE_FLOAT)
