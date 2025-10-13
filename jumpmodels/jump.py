@@ -418,6 +418,7 @@ class JumpModel(BaseClusteringAlgo):
         super().__init__(int(n_components), n_init, max_iter, tol, random_state, verbose)
         self.jump_penalty = jump_penalty
         self.cont = cont
+        self.distribution = distribution
         self.grid_size = grid_size
         self.mode_loss = mode_loss
         self.alpha = 2  # the power raised to the jump penalty in CJM
