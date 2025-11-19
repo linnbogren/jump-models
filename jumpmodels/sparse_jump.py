@@ -156,12 +156,16 @@ def solve_lasso(a: SER_ARR_TYPE,
 def compute_BCSS(X: DF_ARR_TYPE, 
                  proba_: DF_ARR_TYPE, 
                  centers_: Optional[np.ndarray] = None,
-                 tol: float = 1e-6) -> SER_ARR_TYPE:
+                 tol: float = 1e-6,
+                 distribution: str = "Gaussian") -> SER_ARR_TYPE:
     """
-    Compute the Between Cluster Sum of Squares (BCSS).
+    Compute the Between Cluster Sum of Squares (BCSS) or between-state variation.
 
-    The BCSS is computed based on the cluster centers and probabilities. If no centers are provided, 
-    they will be computed from probabilities. Any BCSS values below the tolerance are set to zero.
+    For Gaussian: Uses traditional BCSS based on squared Euclidean distance.
+    For Poisson: Uses KL divergence-based between-state variation.
+
+    The measure is computed based on the cluster centers and probabilities. If no centers are provided, 
+    they will be computed from probabilities. Any values below the tolerance are set to zero.
 
     Parameters
     ----------
@@ -176,20 +180,51 @@ def compute_BCSS(X: DF_ARR_TYPE,
         If not provided, they are estimated from the data.
 
     tol : float, optional (default=1e-6)
-        The tolerance for setting BCSS values to zero.
+        The tolerance for setting values to zero.
+
+    distribution : str, optional (default="Gaussian")
+        The distribution type: "Gaussian" or "Poisson".
 
     Returns
     -------
     Series or ndarray
-        The BCSS values for each feature.
+        The BCSS or between-state variation values for each feature.
     """
     X_arr, proba_arr = check_2d_array(X), check_2d_array(proba_)
     if centers_ is None: centers_ = weighted_mean_cluster(X_arr, proba_arr)
     # replace NAs in centers with 0. won't affect computation
     centers_ = np.nan_to_num(centers_, nan=0.)
-    # assert not np.isnan(centers_).any()
-    Ns = proba_arr.sum(axis=0)
-    BCSS = Ns @ ((centers_ - X_arr.mean(axis=0))**2)
+    
+    if distribution == "Gaussian":
+        # Traditional BCSS for Gaussian (squared Euclidean distance)
+        Ns = proba_arr.sum(axis=0)
+        BCSS = Ns @ ((centers_ - X_arr.mean(axis=0))**2)
+    elif distribution == "Poisson":
+        # Between-state variation based on Poisson KL divergence
+        # a_j = sum_t [global_mean - y_t * (1 + log(global_mean/y_t))] - sum_t [mu_st - y_t * (1 + log(mu_st/y_t))]
+        global_mean = X_arr.mean(axis=0, keepdims=True)  # shape (1, n_f)
+        global_mean = np.maximum(global_mean, 1e-10)  # Avoid log(0)
+        
+        # Total divergence from global mean: sum over all samples
+        with np.errstate(divide='ignore', invalid='ignore'):
+            X_safe = np.maximum(X_arr, 1e-10)
+            total_div = np.sum(global_mean - X_arr * (1 + np.log(global_mean / X_safe)), axis=0)
+        
+        # Within-cluster divergence: for each sample, use its assigned cluster mean
+        labels = proba_arr.argmax(axis=1)  # Hard assignment for simplicity
+        within_div = np.zeros(X_arr.shape[1])
+        for t in range(len(X_arr)):
+            cluster_mean = centers_[labels[t]]
+            cluster_mean = np.maximum(cluster_mean, 1e-10)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                x_safe = np.maximum(X_arr[t], 1e-10)
+                within_div += cluster_mean - X_arr[t] * (1 + np.log(cluster_mean / x_safe))
+        
+        # Between-state variation = Total - Within
+        BCSS = total_div - within_div
+    else:
+        raise NotImplementedError(f"Distribution '{distribution}' not supported.")
+    
     BCSS = set_zero_arr(BCSS, tol=tol)
     assert not np.isnan(BCSS).any()
     return raise_arr_to_pd_obj(BCSS, X, index_key="columns")
@@ -204,6 +239,7 @@ class SparseJumpModel(BaseEstimator):
 
     This model extends the standard jump model by incorporating a Lasso-like feature 
     selection process, where the number of selected features is controlled by `max_feats`.
+    Supports different divergence measures via the `distribution` parameter.
 
     Parameters
     ----------
@@ -217,6 +253,11 @@ class SparseJumpModel(BaseEstimator):
     jump_penalty : float, default=0.
         The jump penalty. In SJM, this penalty is scaled by 
         `1 / sqrt(n_features)` since features are weighted.
+
+    distribution : str, default="Gaussian"
+        The divergence measure to use. Options:
+        - "Gaussian": Squared Euclidean distance (L2)
+        - "Poisson": Poisson KL divergence
 
     cont : bool, default=False
         If `True`, the continuous jump model is used. Otherwise, the discrete model is applied.
@@ -273,7 +314,8 @@ class SparseJumpModel(BaseEstimator):
     def __init__(self,
                  n_components: int = 2, 
                  max_feats: float = 100.,
-                 jump_penalty: float = 0., 
+                 jump_penalty: float = 0.,
+                 distribution: str = "Gaussian",
                  cont: bool = False, 
                  grid_size: float = 0.05, 
                  mode_loss: bool = True, 
@@ -287,6 +329,7 @@ class SparseJumpModel(BaseEstimator):
         self.n_components = int(n_components)
         self.max_feats = max_feats
         self.jump_penalty = jump_penalty
+        self.distribution = distribution
         self.cont = cont
         self.grid_size = grid_size
         self.mode_loss = mode_loss
@@ -301,11 +344,12 @@ class SparseJumpModel(BaseEstimator):
     # reviewed
     def init_jm(self):
         """
-        Initialize the jump model instance with scaled jump penalty.
+        Initialize the jump model instance with scaled jump penalty and distribution setting.
         """
         jump_penalty = self.jump_penalty / np.sqrt(self.n_features_all)
         jm = JumpModel(n_components=self.n_components,
                        jump_penalty=jump_penalty,
+                       distribution=self.distribution,
                        cont=self.cont,
                        grid_size=self.grid_size,
                        mode_loss=self.mode_loss,
@@ -337,7 +381,12 @@ class SparseJumpModel(BaseEstimator):
         Fit the sparse jump model using coordinate descent.
 
         This method iteratively optimizes the feature weights and fits the jump model 
-        on the weighted data.
+        on the weighted data. The algorithm alternates between:
+        (a) Fitting the jump model with current feature weights
+        (b) Updating feature weights based on between-state variation
+
+        For Poisson distribution, the between-state variation is based on KL divergence.
+        For Gaussian distribution, it uses traditional BCSS.
 
         Parameters
         ----------
@@ -381,8 +430,8 @@ class SparseJumpModel(BaseEstimator):
             # Step 2: optimize w
             # update (unweighted) centers
             centers_unweighted = weighted_mean_cluster(X_arr, jm.proba_)
-            # compute BCSS on the original data
-            BCSS = compute_BCSS(X_arr, jm.proba_, centers_unweighted)
+            # compute BCSS or between-state variation on the original data
+            BCSS = compute_BCSS(X_arr, jm.proba_, centers_unweighted, distribution=self.distribution)
             if (BCSS <= 0).all(): # all in one cluster
                 self.print_log(n_iter, BCSS, w)
                 break
