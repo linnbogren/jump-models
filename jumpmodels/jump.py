@@ -209,15 +209,15 @@ def do_E_step(X: np.ndarray,
     # compute loss matrix
     if distribution == "Poisson":
         # Poisson negative log-likelihood loss
-        if np.any(centers_ <= 0):
-            # Using warnings is good practice as it informs without crashing
-            import warnings
-            warnings.warn("Poisson centers (lambda) contain non-positive values. Clamping to a small number.")
-            centers_ = np.maximum(centers_, 1e-10) # A slightly cleaner way to clamp
-
-        # Broadcast X and centers_ to (n_s, n_c, n_f)
-        loss_mx = centers_[np.newaxis, :, :] - X[:, np.newaxis, :] * np.log(centers_[np.newaxis, :, :])
-        loss_mx = np.sum(loss_mx, axis=2)  # shape (n_s, n_c)
+        # Note: If centers contain zeros (from zero feature weights in SJM),
+        # log(0) will produce -inf, making the loss +inf for those features.
+        # This effectively excludes zero-weighted features from the optimization.
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Broadcast X and centers_ to (n_s, n_c, n_f)
+            loss_mx = centers_[np.newaxis, :, :] - X[:, np.newaxis, :] * np.log(centers_[np.newaxis, :, :])
+            loss_mx = np.sum(loss_mx, axis=2)  # shape (n_s, n_c)
+            # Replace any NaN with inf (happens when 0 * log(0) = 0 * -inf = NaN)
+            loss_mx = np.nan_to_num(loss_mx, nan=np.inf, posinf=np.inf, neginf=np.inf)
     elif distribution == "Gaussian":
         loss_mx = .5 * cdist(X, centers_, "sqeuclidean")    # (n_s, n_c)
         # contain `nan` if `centers_` contains `nan`.
@@ -522,6 +522,10 @@ class JumpModel(BaseClusteringAlgo):
         jump_penalty_mx = self.check_jump_penalty_mx()
         # init centers
         init_centers_values = self.init_centers(X_arr)
+        # For Poisson, ensure no zero centers in initialization
+        if self.distribution == "Poisson":
+            for i in range(len(init_centers_values)):
+                init_centers_values[i] = np.maximum(init_centers_values[i], 1e-10)
         # the best results over all initializations, compare to it in the last part of each iteration
         best_val = np.inf
         best_res = {}   # store: "centers_", "proba_", "labels_".
@@ -554,6 +558,15 @@ class JumpModel(BaseClusteringAlgo):
                 best_res['proba_'] = proba_
         self.val_ = best_val
         if verbose: print(f"{best_idx}-th init has the best value: {best_val}.")
+        
+        # Check if we got a valid result
+        if 'centers_' not in best_res:
+            raise ValueError(
+                "All initializations failed to converge to a finite loss. "
+                "This typically happens when feature weights are zero for Poisson distribution, "
+                "producing infinite loss. Consider using larger max_feats or different hyperparameters."
+            )
+        
         # sort states
         sort_states_from_ret(ret_ser, X, best_res, sort_by=sort_by)
         # save attributes

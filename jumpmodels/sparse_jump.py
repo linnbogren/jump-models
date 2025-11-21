@@ -203,7 +203,6 @@ def compute_BCSS(X: DF_ARR_TYPE,
         # Between-state variation based on Poisson KL divergence
         # a_j = sum_t [global_mean - y_t * (1 + log(global_mean/y_t))] - sum_t [mu_st - y_t * (1 + log(mu_st/y_t))]
         global_mean = X_arr.mean(axis=0, keepdims=True)  # shape (1, n_f)
-        global_mean = np.maximum(global_mean, 1e-10)  # Avoid log(0)
         
         # Total divergence from global mean: sum over all samples
         with np.errstate(divide='ignore', invalid='ignore'):
@@ -424,7 +423,8 @@ class SparseJumpModel(BaseEstimator):
             # Step 1: fix w, fit JM
             feat_weights = np.sqrt(w)
             # use the previous optimal center, weighted by the most recent w, as an initialization
-            if n_iter > 1: jm.centers_ = centers_unweighted * feat_weights    
+            if n_iter > 1: 
+                jm.centers_ = centers_unweighted * feat_weights
             # fit JM on weighted data
             jm.fit(X, ret_ser=ret_ser, feat_weights=feat_weights, sort_by=sort_by)
             # Step 2: optimize w
