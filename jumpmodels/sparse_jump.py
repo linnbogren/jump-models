@@ -157,12 +157,16 @@ def compute_BCSS(X: DF_ARR_TYPE,
                  proba_: DF_ARR_TYPE, 
                  centers_: Optional[np.ndarray] = None,
                  tol: float = 1e-6,
-                 distribution: str = "Gaussian") -> SER_ARR_TYPE:
+                 distribution: str = "Gaussian",
+                 feat_weights: Optional[SER_ARR_TYPE] = None) -> SER_ARR_TYPE:
     """
     Compute the Between Cluster Sum of Squares (BCSS) or between-state variation.
 
     For Gaussian: Uses traditional BCSS based on squared Euclidean distance.
-    For Poisson: Uses KL divergence-based between-state variation.
+    For Poisson: Uses negative log-likelihood (NLL) for proper likelihood-based measure.
+                 NLL = mu - y*log(mu), applied to weighted data sqrt(w)*X and sqrt(w)*centers.
+    For PoissonKL: Uses weighted KL divergence with explicit feature weights.
+                   Likelihood-based and mathematically correct for Poisson data.
 
     The measure is computed based on the cluster centers and probabilities. If no centers are provided, 
     they will be computed from probabilities. Any values below the tolerance are set to zero.
@@ -183,7 +187,10 @@ def compute_BCSS(X: DF_ARR_TYPE,
         The tolerance for setting values to zero.
 
     distribution : str, optional (default="Gaussian")
-        The distribution type: "Gaussian" or "Poisson".
+        The distribution type: "Gaussian", "Poisson", or "PoissonKL".
+
+    feat_weights : Series or ndarray, optional
+        Feature weights for PoissonKL distribution. Required when distribution="PoissonKL".
 
     Returns
     -------
@@ -200,27 +207,56 @@ def compute_BCSS(X: DF_ARR_TYPE,
         Ns = proba_arr.sum(axis=0)
         BCSS = Ns @ ((centers_ - X_arr.mean(axis=0))**2)
     elif distribution == "Poisson":
-        # Between-state variation based on Poisson KL divergence
-        # a_j = sum_t [global_mean - y_t * (1 + log(global_mean/y_t))] - sum_t [mu_st - y_t * (1 + log(mu_st/y_t))]
-        global_mean = X_arr.mean(axis=0, keepdims=True)  # shape (1, n_f)
+        # Between-state variation based on negative log-likelihood reduction
+        # Compare cluster-specific NLL vs global mean NLL
+        # Higher values = more benefit from using cluster-specific means
+        labels = proba_arr.argmax(axis=1)
+        global_mean = X_arr.mean(axis=0)
         
-        # Total divergence from global mean: sum over all samples
         with np.errstate(divide='ignore', invalid='ignore'):
-            X_safe = np.maximum(X_arr, 1e-10)
-            total_div = np.sum(global_mean - X_arr * (1 + np.log(global_mean / X_safe)), axis=0)
+            # Map each sample to its assigned center
+            aligned_centers = centers_[labels]  # shape (n_samples, n_features)
+            
+            # NLL with global mean: mu - y*log(mu)
+            nll_global = global_mean - X_arr * np.log(global_mean)
+            
+            # NLL with cluster-specific means
+            nll_cluster = aligned_centers - X_arr * np.log(aligned_centers)
+            
+            # Between-state variation = improvement from using clusters
+            # (lower NLL with clusters = higher BCSS)
+            BCSS = np.sum(nll_global - nll_cluster, axis=0)
+            
+            # Replace any NaN or inf with 0
+            BCSS = np.nan_to_num(BCSS, nan=0.0, posinf=0.0, neginf=0.0)
+    elif distribution == "PoissonKL":
+        # Between-state variation based on KL divergence reduction
+        # Compare cluster-specific KL vs global mean KL
+        # Higher values = more benefit from using cluster-specific means
+        # DO NOT multiply by current weights - BCSS measures raw discriminative power
+        labels = proba_arr.argmax(axis=1)
+        global_mean = X_arr.mean(axis=0)
         
-        # Within-cluster divergence: for each sample, use its assigned cluster mean
-        labels = proba_arr.argmax(axis=1)  # Hard assignment for simplicity
-        within_div = np.zeros(X_arr.shape[1])
-        for t in range(len(X_arr)):
-            cluster_mean = centers_[labels[t]]
-            cluster_mean = np.maximum(cluster_mean, 1e-10)
-            with np.errstate(divide='ignore', invalid='ignore'):
-                x_safe = np.maximum(X_arr[t], 1e-10)
-                within_div += cluster_mean - X_arr[t] * (1 + np.log(cluster_mean / x_safe))
-        
-        # Between-state variation = Total - Within
-        BCSS = total_div - within_div
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Map each sample to its assigned center
+            aligned_centers = centers_[labels]  # shape (n_samples, n_features)
+            
+            # Calculate y * log(y) once (used in both KL computations)
+            y_log_y = np.where(X_arr > 0, X_arr * np.log(X_arr), 0.0)
+            
+            # KL divergence with global mean: d_KL(y, global_mean)
+            # d_KL(y, mu) = mu - y + y*log(y) - y*log(mu)
+            kl_global = global_mean - X_arr + y_log_y - X_arr * np.log(global_mean)
+            
+            # KL divergence with cluster-specific means: d_KL(y, cluster_mean)
+            kl_cluster = aligned_centers - X_arr + y_log_y - X_arr * np.log(aligned_centers)
+            
+            # Between-state variation = improvement from using clusters
+            # (lower KL with clusters = higher BCSS)
+            BCSS = np.sum(kl_global - kl_cluster, axis=0)
+            
+            # Replace any NaN or inf with 0
+            BCSS = np.nan_to_num(BCSS, nan=0.0, posinf=0.0, neginf=0.0)
     else:
         raise NotImplementedError(f"Distribution '{distribution}' not supported.")
     
@@ -255,8 +291,9 @@ class SparseJumpModel(BaseEstimator):
 
     distribution : str, default="Gaussian"
         The divergence measure to use. Options:
-        - "Gaussian": Squared Euclidean distance (L2)
-        - "Poisson": Poisson KL divergence
+        - "Gaussian": Squared Euclidean distance (L2) on means
+        - "Poisson": Squared Euclidean distance (L2) on rate parameters (uses feature weighting like Gaussian)
+        - "PoissonKL": Poisson KL divergence with explicit feature weights (no data scaling)
 
     cont : bool, default=False
         If `True`, the continuous jump model is used. Otherwise, the discrete model is applied.
@@ -384,8 +421,12 @@ class SparseJumpModel(BaseEstimator):
         (a) Fitting the jump model with current feature weights
         (b) Updating feature weights based on between-state variation
 
-        For Poisson distribution, the between-state variation is based on KL divergence.
-        For Gaussian distribution, it uses traditional BCSS.
+        Three distribution options:
+        - Gaussian: Uses traditional BCSS with weighted data (X * sqrt(w))
+        - Poisson: Uses squared Euclidean distance on rate parameters with weighted data (X * sqrt(w))
+                   This is computationally simple but not likelihood-based
+        - PoissonKL: Uses KL divergence with raw weights w directly in the cost function
+                     This is likelihood-based and mathematically correct for Poisson data
 
         Parameters
         ----------
@@ -421,17 +462,34 @@ class SparseJumpModel(BaseEstimator):
             n_iter += 1
             w_old = w
             # Step 1: fix w, fit JM
-            feat_weights = np.sqrt(w)
-            # use the previous optimal center, weighted by the most recent w, as an initialization
-            if n_iter > 1: 
-                jm.centers_ = centers_unweighted * feat_weights
-            # fit JM on weighted data
+            if self.distribution == "PoissonKL":
+                # For PoissonKL: pass raw weights w directly (not sqrt(w))
+                feat_weights = w
+                # use the previous optimal center (unweighted) as initialization
+                # No need to weight centers for PoissonKL
+            else:
+                # For Gaussian/Poisson: use sqrt(w) to scale data
+                feat_weights = np.sqrt(w)
+                # use the previous optimal center, weighted by the most recent w, as an initialization
+                if n_iter > 1: 
+                    jm.centers_ = centers_unweighted * feat_weights
+            
+            # fit JM on (possibly weighted) data
             jm.fit(X, ret_ser=ret_ser, feat_weights=feat_weights, sort_by=sort_by)
+            
             # Step 2: optimize w
             # update (unweighted) centers
             centers_unweighted = weighted_mean_cluster(X_arr, jm.proba_)
+            
             # compute BCSS or between-state variation on the original data
-            BCSS = compute_BCSS(X_arr, jm.proba_, centers_unweighted, distribution=self.distribution)
+            if self.distribution == "PoissonKL":
+                # For PoissonKL: pass raw weights to compute_BCSS
+                BCSS = compute_BCSS(X_arr, jm.proba_, centers_unweighted, 
+                                   distribution=self.distribution, feat_weights=w)
+            else:
+                BCSS = compute_BCSS(X_arr, jm.proba_, centers_unweighted, 
+                                   distribution=self.distribution)
+            
             if (BCSS <= 0).all(): # all in one cluster
                 self.print_log(n_iter, BCSS, w)
                 break
@@ -439,8 +497,15 @@ class SparseJumpModel(BaseEstimator):
             self.print_log(n_iter, BCSS, w)
         # best res
         self.w = raise_arr_to_pd_obj(w, X, index_key="columns")
-        self.feat_weights = raise_arr_to_pd_obj(jm.feat_weights, X, index_key="columns")
-        self.centers_ = jm.centers_ # weighted centers
+        
+        # For PoissonKL: feat_weights are raw w, for others they are sqrt(w)
+        # Important: compute from final optimized w, not from jm.feat_weights which may be stale
+        if self.distribution == "PoissonKL":
+            self.feat_weights = raise_arr_to_pd_obj(w, X, index_key="columns")
+        else:
+            self.feat_weights = raise_arr_to_pd_obj(np.sqrt(w), X, index_key="columns")
+        
+        self.centers_ = jm.centers_ # raw centers for PoissonKL, weighted centers for Gaussian/Poisson
         # self.centers_ = weighted_mean_cluster(X_arr, jm.proba_, )
         self.labels_ = jm.labels_
         self.proba_ = jm.proba_

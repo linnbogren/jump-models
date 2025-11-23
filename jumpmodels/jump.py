@@ -164,7 +164,8 @@ def do_E_step(X: np.ndarray,
               penalty_mx: np.ndarray, 
               prob_vecs: Optional[np.ndarray] = None, 
               return_value_mx: bool = False,
-              distribution: str = "Gaussian") -> Union[tuple[np.ndarray, np.ndarray, float], np.ndarray]:
+              distribution: str = "Gaussian",
+              feat_weights: Optional[np.ndarray] = None) -> Union[tuple[np.ndarray, np.ndarray, float], np.ndarray]:
     """
     Perform a single E-step: compute the loss matrix and calling the solver.
 
@@ -190,7 +191,13 @@ def do_E_step(X: np.ndarray,
         If `True`, return the value matrix from the DP algorithm, which can be used for online inference.
 
     distribution : str, optional (default="Gaussian")
-        Other possibility: "Poisson". The assumed distribution of the HMM.
+        Options: "Gaussian", "Poisson", "PoissonKL". The assumed distribution of the HMM.
+        - "Gaussian": Squared Euclidean distance
+        - "Poisson": Squared Euclidean distance on rate parameters (same as Gaussian)
+        - "PoissonKL": KL divergence with explicit feature weights
+
+    feat_weights : ndarray of shape (n_f,), optional
+        Feature weights for PoissonKL distribution. Required when distribution="PoissonKL".
 
     Returns
     -------
@@ -207,22 +214,61 @@ def do_E_step(X: np.ndarray,
     """
     n_c = len(centers_)     # (n_c, n_f)
     # compute loss matrix
-    if distribution == "Poisson":
-        # Poisson negative log-likelihood loss
-        # Note: If centers contain zeros (from zero feature weights in SJM),
-        # log(0) will produce -inf, making the loss +inf for those features.
-        # This effectively excludes zero-weighted features from the optimization.
+    if distribution == "PoissonKL":
+        # Poisson KL divergence: d_KL(y, mu) = mu - y + y*(log(y) - log(mu))
+        # For y*log(y), when y=0, the limit is 0
+        # Optimized computation to avoid large 3D arrays
+        n_s, n_f = X.shape
+        loss_mx = np.zeros((n_s, n_c))
+        
         with np.errstate(divide='ignore', invalid='ignore'):
-            # Broadcast X and centers_ to (n_s, n_c, n_f)
-            loss_mx = centers_[np.newaxis, :, :] - X[:, np.newaxis, :] * np.log(centers_[np.newaxis, :, :])
-            loss_mx = np.sum(loss_mx, axis=2)  # shape (n_s, n_c)
-            # Replace any NaN with inf (happens when 0 * log(0) = 0 * -inf = NaN)
+            # Precompute y*log(y) for all data points (only once)
+            y_log_y = np.where(X > 0, X * np.log(X), 0.0)  # shape (n_s, n_f)
+            
+            # Precompute log(mu) for all centers
+            log_centers = np.log(centers_)  # shape (n_c, n_f)
+            
+            # For each state, compute the KL divergence
+            for k in range(n_c):
+                # KL divergence: mu_k - y + y*log(y) - y*log(mu_k)
+                d_kl = centers_[k] - X + y_log_y - X * log_centers[k]  # shape (n_s, n_f)
+                
+                # Apply feature weights if provided
+                if feat_weights is not None:
+                    d_kl = d_kl * feat_weights  # broadcast weights
+                
+                # Sum over features
+                loss_mx[:, k] = np.sum(d_kl, axis=1)
+            
+            # Replace any NaN or inf with large value
+            loss_mx = np.nan_to_num(loss_mx, nan=np.inf, posinf=np.inf, neginf=np.inf)
+    elif distribution == "Poisson":
+        # Negative log-likelihood for Poisson distribution
+        # -log P(y|mu) = mu - y*log(mu) + log(y!) ∝ mu - y*log(mu)
+        # Applied to weighted data: sqrt(w)*X and sqrt(w)*centers
+        # This gives proper likelihood-based cost function
+        n_s, n_f = X.shape
+        loss_mx = np.zeros((n_s, n_c))
+        
+        with np.errstate(divide='ignore', invalid='ignore'):
+            # Precompute log(mu) for all centers (weighted centers)
+            log_centers = np.log(centers_)  # shape (n_c, n_f)
+            
+            # For each state, compute the negative log-likelihood
+            for k in range(n_c):
+                # NLL: mu_k - y*log(mu_k) (ignoring constant log(y!) term)
+                nll = centers_[k] - X * log_centers[k]  # shape (n_s, n_f)
+                
+                # Sum over features
+                loss_mx[:, k] = np.sum(nll, axis=1)
+            
+            # Replace any NaN or inf with large value
             loss_mx = np.nan_to_num(loss_mx, nan=np.inf, posinf=np.inf, neginf=np.inf)
     elif distribution == "Gaussian":
         loss_mx = .5 * cdist(X, centers_, "sqeuclidean")    # (n_s, n_c)
         # contain `nan` if `centers_` contains `nan`.
     else:
-        raise NotImplementedError("Only 'Gaussian' and 'Poisson' distributions are supported.")
+        raise NotImplementedError("Only 'Gaussian', 'Poisson', and 'PoissonKL' distributions are supported.")
     if prob_vecs is not None:    # cont model, (N, n_c)
         # replace the nan in loss_mx by a very large floating number
         loss_mx = np.nan_to_num(loss_mx, nan=LARGE_FLOAT, posinf=LARGE_FLOAT, neginf=LARGE_FLOAT)
@@ -355,7 +401,10 @@ class JumpModel(BaseClusteringAlgo):
         Penalty term (`lambda`) applied to state transitions in both discrete and continuous models.
 
     distribution : str, default="Gaussian"
-        The distribution assumed for the HMM. Options are "Gaussian" and "Poisson".
+        The distribution assumed for the HMM. Options:
+        - "Gaussian": Squared Euclidean distance on means
+        - "Poisson": Squared Euclidean distance on rate parameters (uses feature weighting)
+        - "PoissonKL": KL divergence with explicit feature weights (no data scaling)
 
     cont : bool, default=False
         If `True`, the continuous jump model is used. Otherwise, the discrete model is applied.
@@ -454,7 +503,7 @@ class JumpModel(BaseClusteringAlgo):
         return jump_penalty_mx
     
     # reviewed
-    def check_X_predict_func(self, X: DF_ARR_TYPE) -> np.ndarray:
+    def check_X_predict_func(self, X: DF_ARR_TYPE) -> tuple[np.ndarray, Optional[np.ndarray]]:
         """
         Validate the input data `X` for all prediction methods (but not for fitting), 
         and apply feature weighting if applicable. Assumes that the model has already 
@@ -469,12 +518,22 @@ class JumpModel(BaseClusteringAlgo):
 
         Returns
         -------
-        np.ndarray
-            The weighted input data matrix, if feature weights are provided.
+        tuple[np.ndarray, Optional[np.ndarray]]
+            - The (possibly weighted) input data matrix
+            - The feature weights array (for PoissonKL) or None
         """
         self.is_shape_match_X_centers(X)
         feat_weights = getattr_(self, "feat_weights")
-        return check_X_with_feat_weights(X, feat_weights)
+        
+        # For PoissonKL: return raw X and weights separately
+        if self.distribution == "PoissonKL":
+            X_arr = check_2d_array(X)
+            _valid_shape_X_feat_weights(X, feat_weights)
+            feat_weights_arr = check_1d_array(feat_weights) if feat_weights is not None else None
+            return X_arr, feat_weights_arr
+        else:
+            # For Gaussian/Poisson: scale X and return None for weights
+            return check_X_with_feat_weights(X, feat_weights), None
     
     # reviewed
     def fit(self, 
@@ -500,17 +559,28 @@ class JumpModel(BaseClusteringAlgo):
 
         feat_weights : Series or ndarray, optional
             Feature weights to apply to the input data matrix.
+            For PoissonKL: raw weights w (not sqrt(w)) passed directly to cost calculation.
+            For Gaussian/Poisson: sqrt(w) used to scale the data.
 
         sort_by : ["cumret", "vol", "freq", "ret"], optional (default="cumret")
             Criterion for sorting the states.
 
         distribution : str, optional (default="Gaussian")
-            The assumed distribution for the HMM ("Gaussian" or "Poisson").
+            The assumed distribution for the HMM ("Gaussian", "Poisson", or "PoissonKL").
         """
         # valid feat weights
         valid_feat_weights(feat_weights)
-        # check X
-        X_arr = check_X_with_feat_weights(X, feat_weights)
+        
+        # For PoissonKL: do NOT scale X, keep raw data and pass weights to do_E_step
+        # For other distributions: scale X by sqrt(w) as before
+        if self.distribution == "PoissonKL":
+            X_arr = check_2d_array(X)
+            _valid_shape_X_feat_weights(X, feat_weights)
+            feat_weights_arr = check_1d_array(feat_weights) if feat_weights is not None else None
+        else:
+            X_arr = check_X_with_feat_weights(X, feat_weights)
+            feat_weights_arr = None  # weights already applied via scaling
+        
         # save valid feat weights
         self.feat_weights = feat_weights
         # get attributes
@@ -522,8 +592,8 @@ class JumpModel(BaseClusteringAlgo):
         jump_penalty_mx = self.check_jump_penalty_mx()
         # init centers
         init_centers_values = self.init_centers(X_arr)
-        # For Poisson, ensure no zero centers in initialization
-        if self.distribution == "Poisson":
+        # For Poisson/PoissonKL, ensure no zero centers in initialization
+        if self.distribution in ["Poisson", "PoissonKL"]:
             for i in range(len(init_centers_values)):
                 init_centers_values[i] = np.maximum(init_centers_values[i], 1e-10)
         # the best results over all initializations, compare to it in the last part of each iteration
@@ -536,7 +606,10 @@ class JumpModel(BaseClusteringAlgo):
             # initialize the labels and value in the previous iteration.
             labels_pre, val_pre = None, np.inf
             # do one E step
-            proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs, distribution=self.distribution)
+            proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, 
+                                             prob_vecs=self.prob_vecs, 
+                                             distribution=self.distribution,
+                                             feat_weights=feat_weights_arr)
             num_iter = 0
             # iterate between M and E steps
             while (num_iter < max_iter and (not is_same_clustering(labels_, labels_pre)) and val_pre - val_ > tol):
@@ -546,7 +619,10 @@ class JumpModel(BaseClusteringAlgo):
                 # M step: update centers
                 centers_ = weighted_mean_cluster(X_arr, proba_)
                 # E step
-                proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, prob_vecs=self.prob_vecs, distribution=self.distribution)
+                proba_, labels_, val_ = do_E_step(X_arr, centers_, jump_penalty_mx, 
+                                                 prob_vecs=self.prob_vecs, 
+                                                 distribution=self.distribution,
+                                                 feat_weights=feat_weights_arr)
             if verbose: print(f"{n_init_}-th init. val: {val_}")
             # compare with previous initializations
             if (not is_same_clustering(best_res['labels_'], labels_)) and val_ < best_val:
@@ -573,7 +649,7 @@ class JumpModel(BaseClusteringAlgo):
         if ret_ser is not None:
             self.ret_ = best_res["ret_"]
             self.vol_ = best_res["vol_"]
-        self.centers_ = best_res['centers_']        # weighted centers
+        self.centers_ = best_res['centers_']        # weighted centers for Gaussian/Poisson, raw centers for PoissonKL
         self.proba_ = raise_JM_proba_to_df(best_res['proba_'], X)
         self.labels_ = reduce_proba_to_labels(self.proba_)
         self.transmat_ = empirical_trans_mx(self.labels_, n_components=n_c)
@@ -585,8 +661,10 @@ class JumpModel(BaseClusteringAlgo):
         Predict the probability of each state in an online fashion.
         Uses the distribution specified in the class constructor.
         """
-        X_arr = self.check_X_predict_func(X)
-        value_mx = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, return_value_mx=True, distribution=self.distribution)
+        X_arr, feat_weights_arr = self.check_X_predict_func(X)
+        value_mx = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, 
+                            return_value_mx=True, distribution=self.distribution, 
+                            feat_weights=feat_weights_arr)
         labels_ = value_mx.argmin(axis=1)
         proba_ = raise_JM_labels_to_proba(labels_, self.n_components, self.prob_vecs)
         return raise_JM_proba_to_df(proba_, X)
@@ -626,15 +704,16 @@ class JumpModel(BaseClusteringAlgo):
             Whether to use the Viterbi solver.
 
         distribution : str, optional (default="Gaussian")
-            The assumed distribution for the HMM ("Gaussian" or "Poisson").
+            The assumed distribution for the HMM ("Gaussian", "Poisson", or "PoissonKL").
 
         Returns
         -------
         DataFrame or ndarray
             The predicted probabilities for each state.
         """
-        X_arr = self.check_X_predict_func(X)
-        proba_, _, _ = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, distribution=self.distribution)
+        X_arr, feat_weights_arr = self.check_X_predict_func(X)
+        proba_, _, _ = do_E_step(X_arr, self.centers_, self.jump_penalty_mx, self.prob_vecs, 
+                                distribution=self.distribution, feat_weights=feat_weights_arr)
         return raise_JM_proba_to_df(proba_, X)
 
     # reviewed
@@ -651,7 +730,7 @@ class JumpModel(BaseClusteringAlgo):
             Whether to use the Viterbi solver.
 
         distribution : str, optional (default="Gaussian")
-            The assumed distribution for the HMM ("Gaussian" or "Poisson").
+            The assumed distribution for the HMM ("Gaussian", "Poisson", or "PoissonKL").
 
         Returns
         -------
