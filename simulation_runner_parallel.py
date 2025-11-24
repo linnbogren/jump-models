@@ -33,11 +33,14 @@ from simulation_utils import (
     generate_poisson_hmm_data, generate_negative_binomial_hmm_data,
     generate_gaussian_hmm_data,
     compute_persistence_reliability, compute_feature_selection_metrics,
-    compute_poisson_deviance, get_selected_features, split_train_validation,
+    compute_poisson_deviance, get_selected_features,
     compute_chamfer_distance, extract_breakpoints,
     compute_bac_best_permutation
 )
 from sklearn.metrics import balanced_accuracy_score, accuracy_score
+
+# Global variable to track if we should save models
+SAVE_BEST_MODELS = False
 
 
 ###############################################################################
@@ -54,14 +57,14 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
     Parameters:
     -----------
     args : Tuple
-        (config, model_name, hyperparameter_grid) unpacked from pool.map
+        (config, model_name, hyperparameter_grid, save_models) unpacked from pool.map
         
     Returns:
     --------
     all_grid_results : List[GridSearchResult]
         Results from ALL models in the grid search.
     """
-    config, model_name, hyperparameter_grid = args
+    config, model_name, hyperparameter_grid, save_models = args
     
     # Suppress sklearn warnings in worker processes to avoid clutter
     import warnings
@@ -77,16 +80,14 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
     else:
         raise ValueError(f"Unknown distribution type: {config.distribution_type}")
     
-    # Split into train and validation
-    X_train, X_val, states_train, states_val = split_train_validation(
-        X, states, val_size=100
-    )
-    
-    # Extract true breakpoints from the training data
-    true_breakpoints = extract_breakpoints(states_train)
+    # Extract true breakpoints from the full sequence
+    true_breakpoints = extract_breakpoints(states)
     
     # Grid search: try all hyperparameter combinations
     all_grid_results = []  # Store ALL results
+    best_model = None
+    best_bac = -1.0
+    best_grid_result = None
     
     for model_params in hyperparameter_grid:
         # Initialize model
@@ -103,20 +104,20 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
         )
         
         try:
-            # Fit model
+            # Fit model on full sequence
             fit_start = time.time()
-            model.fit(X_train)
+            model.fit(X)
             fit_time = time.time() - fit_start
             
-            # Get predictions
+            # Get predictions on full sequence
             pred_states = model.labels_.values if hasattr(model.labels_, 'values') else model.labels_
             
-            # Compute metrics with label permutation handling
-            bac = compute_bac_best_permutation(states_train, pred_states)
-            acc = accuracy_score(states_train, pred_states)  # Note: accuracy also needs permutation, but we keep for compatibility
+            # Compute metrics with label permutation handling (on full sequence)
+            bac = compute_bac_best_permutation(states, pred_states)
+            acc = accuracy_score(states, pred_states)  # Note: accuracy also needs permutation, but we keep for compatibility
             
             n_jumps_true, n_jumps_est, pers_error = compute_persistence_reliability(
-                states_train, pred_states
+                states, pred_states
             )
             
             # Compute Chamfer distance between true and estimated breakpoints
@@ -130,13 +131,6 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
             feat_metrics = compute_feature_selection_metrics(
                 selected_features, config.n_informative, config.n_total_features
             )
-            
-            # Compute deviance on validation set
-            pred_states_val = model.predict(X_val)
-            pred_states_val = pred_states_val.values if hasattr(pred_states_val, 'values') else pred_states_val
-            lambda_pred = model.centers_[pred_states_val]
-            y_true_val = X_val.values
-            deviance = compute_poisson_deviance(y_true_val, lambda_pred)
             
             # Store this grid point's results
             grid_result = GridSearchResult(
@@ -160,6 +154,12 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
                 computation_time=fit_time
             )
             all_grid_results.append(grid_result)
+            
+            # Track best model if saving models
+            if save_models and bac > best_bac:
+                best_bac = bac
+                best_model = model
+                best_grid_result = grid_result
                 
         except Exception as e:
             # If fitting fails, skip this hyperparameter combination
@@ -167,7 +167,11 @@ def run_single_replication_worker(args: Tuple) -> List[GridSearchResult]:
             continue
     
     # Return all results - best selection happens later
-    return all_grid_results
+    # If saving models, return tuple with best model
+    if save_models and best_model is not None:
+        return (all_grid_results, best_model, best_grid_result)
+    else:
+        return all_grid_results
 
 
 ###############################################################################
@@ -331,7 +335,8 @@ def select_best_models(grid_results: List[GridSearchResult]) -> pd.DataFrame:
 def run_full_simulation_parallel(n_replications: int = 100,
                                   output_dir: str = "results",
                                   quick_test: bool = False,
-                                  n_jobs: int = -1) -> pd.DataFrame:
+                                  n_jobs: int = -1,
+                                  save_models: bool = False) -> pd.DataFrame:
     """
     Run the complete simulation study with parallel processing.
     
@@ -345,6 +350,9 @@ def run_full_simulation_parallel(n_replications: int = 100,
         If True, run a small subset for testing.
     n_jobs : int
         Number of parallel jobs. -1 uses all available CPUs.
+    save_models : bool
+        If True, save the best fitted model for each (config, model_name) pair.
+        Models are saved as pickle files in output_dir/models/
         
     Returns:
     --------
@@ -364,13 +372,15 @@ def run_full_simulation_parallel(n_replications: int = 100,
     output_path.mkdir(parents=True, exist_ok=True)
     (output_path / "aggregated").mkdir(exist_ok=True)
     (output_path / "grid_search").mkdir(exist_ok=True)
+    if save_models:
+        (output_path / "models").mkdir(exist_ok=True)
+        print(f"Model saving is ENABLED - fitted models will be saved to {output_path / 'models'}")
     
     # Get configuration grids
     data_configs = create_data_config_grid(quick_test=quick_test)
     model_names = ["Gaussian", "Poisson", "PoissonKL"]
     
     if quick_test:
-        n_replications = 1  # Single iteration with reduced grid
         print("Running in QUICK TEST mode:")
         print("  - 3 data configs (P: min/center/max)")
         print("  - 3 delta values (δ: min/center/max)")
@@ -378,12 +388,12 @@ def run_full_simulation_parallel(n_replications: int = 100,
         print("  - 3 jump_penalty values (λ: min/center/max)")
         print("  - 3 max_feats values (κ²: min/center/max)")
         print("  - Poisson data only, no correlated noise")
-        print("  - 1 replication")
+        print(f"  - {n_replications} replication(s)")
     
     print(f"Total configurations: {len(data_configs)}")
-    print(f"Models: {len(model_names)}")
+    print(f"Models: {len(model_names)} (all fitted on SAME data per replication)")
     print(f"Replications per config: {n_replications}")
-    print(f"Total runs: {len(data_configs) * len(model_names) * n_replications}")
+    print(f"Total tasks: {len(data_configs) * n_replications} (each task fits all 3 models)")
     
     # Prepare all tasks for parallel execution
     all_tasks = []
@@ -418,7 +428,7 @@ def run_full_simulation_parallel(n_replications: int = 100,
                 )
                 
                 # Add task to queue
-                all_tasks.append((config, model_name, hyperparam_grid))
+                all_tasks.append((config, model_name, hyperparam_grid, save_models))
                 task_metadata.append({
                     'config': config,
                     'model_name': model_name,
@@ -459,10 +469,25 @@ def run_full_simulation_parallel(n_replications: int = 100,
             
             # Process results as they complete
             batch_idx = batch_offset
-            for grid_results in tqdm(results_iter, total=len(tasks_to_run), 
+            for result in tqdm(results_iter, total=len(tasks_to_run), 
                                     desc="Running simulations", initial=batch_offset):
                 try:
-                    # Save this batch immediately (incremental save)
+                    # Handle result (could be grid_results or (grid_results, model, best_result))
+                    if save_models and isinstance(result, tuple):
+                        grid_results, best_model, best_grid_result = result
+                        
+                        # Save the best model
+                        model_filename = (f"model_{best_grid_result.model_name}_"
+                                        f"seed{best_grid_result.config.random_seed}_"
+                                        f"P{best_grid_result.config.n_total_features}_"
+                                        f"delta{best_grid_result.config.delta}.pkl")
+                        model_path = output_path / "models" / model_filename
+                        with open(model_path, 'wb') as f:
+                            pickle.dump(best_model, f)
+                    else:
+                        grid_results = result
+                    
+                    # Save grid results batch immediately (incremental save)
                     batch_file = incremental_dir / f"batch_{batch_idx:06d}.pkl"
                     with open(batch_file, 'wb') as f:
                         pickle.dump(grid_results, f)
@@ -642,6 +667,8 @@ def main():
                        help="Run full grid search but with only 1 replication")
     parser.add_argument('--n_jobs', type=int, default=-1,
                        help="Number of parallel jobs (-1 for all CPUs)")
+    parser.add_argument('--save_models', action='store_true',
+                       help="Save fitted models for later visualization (increases storage)")
     
     args = parser.parse_args()
     
@@ -664,7 +691,8 @@ def main():
         n_replications=args.n_replications,
         output_dir=args.output_dir,
         quick_test=args.quick_test,
-        n_jobs=args.n_jobs
+        n_jobs=args.n_jobs,
+        save_models=args.save_models
     )
     
     elapsed_time = time.time() - start_time
