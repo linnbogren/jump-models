@@ -20,6 +20,8 @@ dependencies = [
   "scipy",
   "scikit-learn",
   "matplotlib",
+  "tqdm (>=4.67.1,<5.0.0)",
+  "seaborn (>=0.13.2,<0.14.0)",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",
