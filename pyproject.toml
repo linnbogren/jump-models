@@ -2,16 +2,14 @@
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
-
-
-
 [project]
 name = "jumpmodels"
-version = "0.1.1"
+version = "0.2.0"
 authors = [
   { name="Yizhan Shu", email="olivershu98@gmail.com" },
+  { name="Linn Bogren" },
 ]
-description = "Statistical Jump Models in Python, with scikit-learn-style APIs"
+description = "Statistical Jump Models in Python, with scikit-learn-style APIs. Includes Sparse Poisson Jump Model framework for count data with state-dependent rates. Original jump model framework: Yizhan Shu, olivershu98@gmail.com"
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
@@ -33,9 +31,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Mathematics",
     "Topic :: Scientific/Engineering :: Information Analysis",
 ]
-keywords = ["regime", "regime switching", "jump models", "clustering", "time series", "financial data"]
-
-
+keywords = ["regime", "regime switching", "jump models", "clustering", "time series", "financial data", "poisson", "count data"]
 
 
 
@@ -47,9 +43,7 @@ example = [
 
 
 
-
-
-
 [project.urls]
-Homepage = "https://github.com/Yizhan-Oliver-Shu/jump-models"
+Homepage = "
+Homepage_original = "https://github.com/Yizhan-Oliver-Shu/jump-models"
 Issues = "https://github.com/Yizhan-Oliver-Shu/jump-models/issues"
